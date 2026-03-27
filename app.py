@@ -10,13 +10,10 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, top_k_accuracy_score
 from sklearn.preprocessing import LabelEncoder
 
-# =========================
-# 页面设置
-# =========================
-st.set_page_config(page_title="特肖预测系统", page_icon="📊", layout="wide")
+st.set_page_config(page_title="特肖预测系统 Pro", page_icon="📊", layout="wide")
 
-st.title("📊 特肖预测系统（多模型融合）")
-st.caption("上传 Excel / CSV 历史数据，训练模型后预测下一期 Top4 特肖")
+st.title("📊 特肖预测系统 Pro")
+st.caption("上传历史数据，训练模型，滚动回测，并预测下一期 Top4 特肖")
 
 # =========================
 # 可选依赖检测
@@ -34,7 +31,6 @@ try:
 except Exception:
     LGB_OK = False
 
-
 # =========================
 # 基础配置
 # =========================
@@ -45,7 +41,6 @@ SIZE_THRESHOLD = 24
 BASE_NUM_COLS = ["平一", "平二", "平三", "平四", "平五", "平六", "特码"]
 BASE_COLOR_COLS = ["平一波", "平二波", "平三波", "平四波", "平五波", "平六波", "特码波"]
 BASE_ZODIAC_COLS = ["平一生肖", "平二生肖", "平三生肖", "平四生肖", "平五生肖", "平六生肖", "特码生肖"]
-
 
 # =========================
 # 工具函数
@@ -155,16 +150,20 @@ def encode_categories(df: pd.DataFrame):
     return df, zodiac_encoder
 
 
-def add_history_features(df: pd.DataFrame, windows=(5, 10, 20)) -> pd.DataFrame:
+def add_history_features(df: pd.DataFrame, windows=(5, 10, 20, 30)) -> pd.DataFrame:
     df = df.copy()
 
     df["特码_lag1"] = df["特码"].shift(1)
     df["特码_lag2"] = df["特码"].shift(2)
     df["特码_lag3"] = df["特码"].shift(3)
+    df["特码_lag4"] = df["特码"].shift(4)
+    df["特码_lag5"] = df["特码"].shift(5)
 
     df["特码生肖_lag1"] = df["特码生肖"].shift(1)
     df["特码生肖_lag2"] = df["特码生肖"].shift(2)
     df["特码生肖_lag3"] = df["特码生肖"].shift(3)
+    df["特码生肖_lag4"] = df["特码生肖"].shift(4)
+    df["特码生肖_lag5"] = df["特码生肖"].shift(5)
 
     df["特码波_lag1"] = df["特码波"].shift(1)
     df["特码波_lag2"] = df["特码波"].shift(2)
@@ -207,7 +206,7 @@ def build_features(df: pd.DataFrame):
     df = preprocess_raw(df)
     df = add_basic_features(df)
     df, zodiac_encoder = encode_categories(df)
-    df = add_history_features(df, windows=(5, 10, 20))
+    df = add_history_features(df, windows=(5, 10, 20, 30))
     df = df.dropna().reset_index(drop=True)
     return df, zodiac_encoder
 
@@ -225,13 +224,21 @@ def time_split_train_valid(df: pd.DataFrame, valid_ratio=0.2):
     return train_df, valid_df
 
 
+def safe_topk_accuracy(y_true, y_score, k=4):
+    labels = np.arange(y_score.shape[1])
+    return top_k_accuracy_score(y_true, y_score, k=k, labels=labels)
+
+
+# =========================
+# 模型
+# =========================
 def train_xgboost(X_train, y_train, num_classes):
     if not XGB_OK:
         return None
     model = XGBClassifier(
-        n_estimators=250,
-        max_depth=6,
-        learning_rate=0.03,
+        n_estimators=220,
+        max_depth=5,
+        learning_rate=0.04,
         subsample=0.85,
         colsample_bytree=0.85,
         objective="multi:softprob",
@@ -249,8 +256,8 @@ def train_lightgbm(X_train, y_train, num_classes):
     if not LGB_OK:
         return None
     model = LGBMClassifier(
-        n_estimators=250,
-        learning_rate=0.03,
+        n_estimators=220,
+        learning_rate=0.04,
         max_depth=-1,
         num_leaves=31,
         subsample=0.85,
@@ -284,7 +291,7 @@ def evaluate_model(model, X_valid, y_valid, topk=4):
     pred = np.argmax(proba, axis=1)
 
     acc = accuracy_score(y_valid, pred)
-    topk_acc = top_k_accuracy_score(y_valid, proba, k=topk)
+    topk_acc = safe_topk_accuracy(y_valid, proba, k=topk)
     return {"acc": acc, "topk_acc": topk_acc, "proba": proba}
 
 
@@ -313,11 +320,102 @@ def build_next_issue_feature_row(df_features: pd.DataFrame, feature_cols: list) 
     return last_row[feature_cols].copy()
 
 
+def get_top4_from_proba(proba_row, zodiac_encoder):
+    top4_idx = np.argsort(proba_row)[::-1][:4]
+    rows = []
+    for i, idx in enumerate(top4_idx, start=1):
+        rows.append({
+            "排名": i,
+            "生肖": zodiac_encoder.classes_[idx],
+            "概率": round(float(proba_row[idx]), 6)
+        })
+    return pd.DataFrame(rows)
+
+
+def get_all_probs_df(proba_row, zodiac_encoder):
+    rows = []
+    for idx in np.argsort(proba_row)[::-1]:
+        rows.append({
+            "生肖": zodiac_encoder.classes_[idx],
+            "概率": round(float(proba_row[idx]), 6)
+        })
+    return pd.DataFrame(rows)
+
+
+def run_walk_forward_backtest(
+    df_features,
+    feature_cols,
+    zodiac_encoder,
+    start_train_size=180,
+    step=1,
+    xgb_weight=0.5,
+    lgb_weight=0.3,
+    rf_weight=0.2
+):
+    results = []
+    num_classes = len(zodiac_encoder.classes_)
+
+    for i in range(start_train_size, len(df_features), step):
+        train_df = df_features.iloc[:i].copy()
+        test_df = df_features.iloc[i:i+1].copy()
+
+        if len(test_df) == 0:
+            continue
+
+        X_train = train_df[feature_cols]
+        y_train = train_df["特码生肖"]
+
+        X_test = test_df[feature_cols]
+        y_test = int(test_df["特码生肖"].iloc[0])
+
+        xgb_model = train_xgboost(X_train, y_train, num_classes) if xgb_weight > 0 else None
+        lgb_model = train_lightgbm(X_train, y_train, num_classes) if lgb_weight > 0 else None
+        rf_model = train_random_forest(X_train, y_train) if rf_weight > 0 else None
+
+        models_with_weights = []
+        if xgb_model is not None:
+            models_with_weights.append((xgb_model, xgb_weight))
+        if lgb_model is not None:
+            models_with_weights.append((lgb_model, lgb_weight))
+        if rf_model is not None:
+            models_with_weights.append((rf_model, rf_weight))
+
+        if not models_with_weights:
+            continue
+
+        proba = ensemble_predict_proba(models_with_weights, X_test)[0]
+        pred_top1 = int(np.argmax(proba))
+        pred_top4 = list(np.argsort(proba)[::-1][:4])
+
+        actual_name = zodiac_encoder.classes_[y_test]
+        pred1_name = zodiac_encoder.classes_[pred_top1]
+        top4_names = [zodiac_encoder.classes_[x] for x in pred_top4]
+
+        hit_top1 = int(y_test == pred_top1)
+        hit_top4 = int(y_test in pred_top4)
+
+        results.append({
+            "期号": test_df["expect"].iloc[0],
+            "开奖时间": test_df["openTime"].iloc[0],
+            "实际生肖": actual_name,
+            "预测Top1": pred1_name,
+            "预测Top4": ", ".join(top4_names),
+            "Top1命中": hit_top1,
+            "Top4命中": hit_top4
+        })
+
+    return pd.DataFrame(results)
+
+
 # =========================
 # 侧边栏
 # =========================
 st.sidebar.header("参数设置")
-valid_ratio = st.sidebar.slider("验证集比例", 0.1, 0.4, 0.2, 0.05)
+
+valid_ratio = st.sidebar.slider("单次验证集比例", 0.1, 0.4, 0.2, 0.05)
+enable_backtest = st.sidebar.checkbox("开启滚动回测", value=True)
+backtest_train_size = st.sidebar.slider("回测起始训练集大小", 120, 260, 180, 10)
+backtest_step = st.sidebar.slider("回测步长", 1, 10, 1, 1)
 
 xgb_weight = st.sidebar.slider("XGBoost 权重", 0.0, 1.0, 0.5, 0.1)
 lgb_weight = st.sidebar.slider("LightGBM 权重", 0.0, 1.0, 0.3, 0.1)
@@ -341,8 +439,8 @@ if uploaded_file is not None:
 
         df_features, zodiac_encoder = build_features(raw_df)
 
-        if len(df_features) < 80:
-            st.error("有效样本太少，建议至少80条以上，最好200~300条以上。")
+        if len(df_features) < 100:
+            st.error("有效样本太少，建议至少100条以上，最好300条以上。")
             st.stop()
 
         feature_cols = get_feature_columns(df_features)
@@ -350,7 +448,6 @@ if uploaded_file is not None:
 
         X_train = train_df[feature_cols]
         y_train = train_df["特码生肖"]
-
         X_valid = valid_df[feature_cols]
         y_valid = valid_df["特码生肖"]
 
@@ -358,93 +455,114 @@ if uploaded_file is not None:
 
         st.info(f"有效样本数: {len(df_features)} ｜ 特征数: {len(feature_cols)}")
 
-        with st.spinner("正在训练模型，请稍等..."):
-            xgb_model = train_xgboost(X_train, y_train, num_classes)
-            lgb_model = train_lightgbm(X_train, y_train, num_classes)
-            rf_model = train_random_forest(X_train, y_train)
+        with st.spinner("正在训练模型..."):
+            xgb_model = train_xgboost(X_train, y_train, num_classes) if xgb_weight > 0 else None
+            lgb_model = train_lightgbm(X_train, y_train, num_classes) if lgb_weight > 0 else None
+            rf_model = train_random_forest(X_train, y_train) if rf_weight > 0 else None
 
-        col1, col2, col3 = st.columns(3)
+        c1, c2, c3 = st.columns(3)
 
-        xgb_eval = evaluate_model(xgb_model, X_valid, y_valid, topk=4) if xgb_model else None
-        lgb_eval = evaluate_model(lgb_model, X_valid, y_valid, topk=4) if lgb_model else None
-        rf_eval = evaluate_model(rf_model, X_valid, y_valid, topk=4)
+        xgb_eval = evaluate_model(xgb_model, X_valid, y_valid, topk=4) if xgb_model is not None else None
+        lgb_eval = evaluate_model(lgb_model, X_valid, y_valid, topk=4) if lgb_model is not None else None
+        rf_eval = evaluate_model(rf_model, X_valid, y_valid, topk=4) if rf_model is not None else None
 
-        with col1:
+        with c1:
             st.subheader("XGBoost")
             if xgb_eval:
                 st.metric("Top1", f"{xgb_eval['acc']:.4f}")
                 st.metric("Top4", f"{xgb_eval['topk_acc']:.4f}")
             else:
-                st.warning("未安装或不可用")
+                st.warning("未启用")
 
-        with col2:
+        with c2:
             st.subheader("LightGBM")
             if lgb_eval:
                 st.metric("Top1", f"{lgb_eval['acc']:.4f}")
                 st.metric("Top4", f"{lgb_eval['topk_acc']:.4f}")
             else:
-                st.warning("未安装或不可用")
+                st.warning("未启用")
 
-        with col3:
+        with c3:
             st.subheader("RandomForest")
-            st.metric("Top1", f"{rf_eval['acc']:.4f}")
-            st.metric("Top4", f"{rf_eval['topk_acc']:.4f}")
+            if rf_eval:
+                st.metric("Top1", f"{rf_eval['acc']:.4f}")
+                st.metric("Top4", f"{rf_eval['topk_acc']:.4f}")
+            else:
+                st.warning("未启用")
 
         models_with_weights = []
-        if xgb_model is not None and xgb_weight > 0:
+        if xgb_model is not None:
             models_with_weights.append((xgb_model, xgb_weight))
-        if lgb_model is not None and lgb_weight > 0:
+        if lgb_model is not None:
             models_with_weights.append((lgb_model, lgb_weight))
-        if rf_model is not None and rf_weight > 0:
+        if rf_model is not None:
             models_with_weights.append((rf_model, rf_weight))
 
         if not models_with_weights:
-            st.error("至少要保留一个模型权重大于0")
+            st.error("至少保留一个模型权重大于0")
             st.stop()
 
         ensemble_valid_proba = ensemble_predict_proba(models_with_weights, X_valid)
         ensemble_valid_pred = np.argmax(ensemble_valid_proba, axis=1)
 
         ensemble_acc = accuracy_score(y_valid, ensemble_valid_pred)
-        ensemble_top4_acc = top_k_accuracy_score(y_valid, ensemble_valid_proba, k=4)
+        ensemble_top4_acc = safe_topk_accuracy(y_valid, ensemble_valid_proba, k=4)
 
         st.subheader("融合模型结果")
-        c1, c2 = st.columns(2)
-        c1.metric("融合 Top1 Accuracy", f"{ensemble_acc:.4f}")
-        c2.metric("融合 Top4 Accuracy", f"{ensemble_top4_acc:.4f}")
+        cc1, cc2 = st.columns(2)
+        cc1.metric("融合 Top1 Accuracy", f"{ensemble_acc:.4f}")
+        cc2.metric("融合 Top4 Accuracy", f"{ensemble_top4_acc:.4f}")
 
         X_next = build_next_issue_feature_row(df_features, feature_cols)
         next_proba = ensemble_predict_proba(models_with_weights, X_next)[0]
 
-        top4_idx = np.argsort(next_proba)[::-1][:4]
-        top4_data = []
-        for idx in top4_idx:
-            top4_data.append({
-                "排名": len(top4_data) + 1,
-                "生肖": zodiac_encoder.classes_[idx],
-                "概率": round(float(next_proba[idx]), 6)
-            })
-
         st.subheader("下一期推荐 Top4 特肖")
-        st.dataframe(pd.DataFrame(top4_data), use_container_width=True)
-
-        all_data = []
-        for idx in np.argsort(next_proba)[::-1]:
-            all_data.append({
-                "生肖": zodiac_encoder.classes_[idx],
-                "概率": round(float(next_proba[idx]), 6)
-            })
+        st.dataframe(get_top4_from_proba(next_proba, zodiac_encoder), use_container_width=True)
 
         st.subheader("全部生肖概率排序")
-        st.dataframe(pd.DataFrame(all_data), use_container_width=True)
+        st.dataframe(get_all_probs_df(next_proba, zodiac_encoder), use_container_width=True)
+
+        if enable_backtest:
+            st.subheader("滚动回测结果")
+            with st.spinner("正在进行滚动回测，这一步会更慢..."):
+                bt_df = run_walk_forward_backtest(
+                    df_features=df_features,
+                    feature_cols=feature_cols,
+                    zodiac_encoder=zodiac_encoder,
+                    start_train_size=backtest_train_size,
+                    step=backtest_step,
+                    xgb_weight=xgb_weight,
+                    lgb_weight=lgb_weight,
+                    rf_weight=rf_weight
+                )
+
+            if len(bt_df) > 0:
+                top1_hit_rate = bt_df["Top1命中"].mean()
+                top4_hit_rate = bt_df["Top4命中"].mean()
+
+                b1, b2, b3 = st.columns(3)
+                b1.metric("回测次数", len(bt_df))
+                b2.metric("滚动回测 Top1 命中率", f"{top1_hit_rate:.4f}")
+                b3.metric("滚动回测 Top4 命中率", f"{top4_hit_rate:.4f}")
+
+                chart_df = bt_df.copy()
+                chart_df["累计Top1命中率"] = chart_df["Top1命中"].expanding().mean()
+                chart_df["累计Top4命中率"] = chart_df["Top4命中"].expanding().mean()
+
+                st.line_chart(chart_df[["累计Top1命中率", "累计Top4命中率"]])
+
+                with st.expander("查看详细回测记录", expanded=False):
+                    st.dataframe(bt_df, use_container_width=True)
+            else:
+                st.warning("回测结果为空，请调小回测起始训练集大小。")
 
     except Exception as e:
         st.error(f"运行失败: {e}")
 
 else:
-    st.warning("请先上传你的历史数据文件")
+    st.warning("请先上传历史数据文件")
     st.markdown("""
-### 文件字段格式必须包含：
+### 文件字段必须包含：
 - expect
 - openTime
 - 平一、平二、平三、平四、平五、平六、特码
